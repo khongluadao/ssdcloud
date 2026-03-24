@@ -1,0 +1,12 @@
+ssdcloud.net, www.ssdcloud.net {
+  encode gzip
+
+  @api path /api/* /health
+  handle @api {
+    reverse_proxy api:4000
+  }
+
+  handle {
+    reverse_proxy web:80
+  }
+}

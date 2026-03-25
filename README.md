@@ -59,25 +59,54 @@ Or run smoke test script (automates initiate -> presign -> PUT part -> complete)
 node scripts/smoke-upload.mjs ./your-file.zip sk_xxx http://localhost:4000
 ```
 
-## Linux ELF uploader (`up`)
+## Uploader CLI (`up`) for Linux + Windows
 
-Build binary ELF (from Windows, cross-compile for Linux):
+Build both binaries from one command:
 
-```powershell
-$env:GOOS="linux"; $env:GOARCH="amd64"; go build -ldflags="-s -w" -o bin/up ./scripts/up/main.go
-```
+- Windows: `scripts\up\build.bat`
+- Linux/macOS: `sh ./scripts/up/build.sh`
 
-Copy to Linux server and make it executable:
+Output:
+
+- `bin/up` (Linux ELF, amd64)
+- `bin/up.exe` (Windows, amd64)
+
+Install on Linux:
 
 ```bash
-chmod +x ./up
-sudo mv ./up /usr/local/bin/up
+chmod +x ./bin/up
+sudo mv ./bin/up /usr/local/bin/up
 ```
 
-Shortest upload command (set token by command):
+Install on Windows (PowerShell, current user):
+
+```powershell
+Copy-Item .\bin\up.exe "$HOME\AppData\Local\Microsoft\WindowsApps\up.exe"
+```
+
+Auth for `up`:
+
+- `SSD_API_KEY` (recommended for script key, format `sk_...`)
+- Fallback: `SSD_TOKEN`
+  - If value starts with `sk_`, `up` auto-sends `x-api-key`
+  - Otherwise `up` sends `Authorization: Bearer ...`
+
+Shortest upload command (API key):
+
+```bash
+SSD_API_KEY="sk_xxx" up ./your-file.zip
+```
+
+Shortest upload command (JWT):
 
 ```bash
 SSD_TOKEN="your_jwt_token" up ./your-file.zip
+```
+
+Windows (PowerShell):
+
+```powershell
+$env:SSD_API_KEY="sk_xxx"; up.exe .\your-file.zip
 ```
 
 Optional env:
@@ -88,3 +117,25 @@ CLI output:
 
 - Real-time upload percent (`Upload: xx.xx%`)
 - File link after success (`Link: https://...`)
+
+### Troubleshooting token
+
+If `up` reports missing credential:
+
+- Linux/macOS:
+  - `export SSD_API_KEY="sk_xxx"` (recommended)
+  - or `export SSD_TOKEN="your_jwt_token"`
+- Windows PowerShell:
+  - `$env:SSD_API_KEY="sk_xxx"` (recommended)
+  - or `$env:SSD_TOKEN="your_jwt_token"`
+
+If `up` reports `status 401` or `status 403`:
+
+- If using API key (`sk_...`): key is invalid/revoked or lacks permission.
+- If using JWT: token is invalid/expired or lacks permission.
+- Set a new credential again using the commands above.
+
+Note:
+
+- Upload endpoints support API key or JWT.
+- The signed download link endpoint requires JWT. If you upload with API key, `up` prints `File ID` after upload completion.

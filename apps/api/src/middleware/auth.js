@@ -11,7 +11,7 @@ async function resolveUserByJwt(req) {
   const token = header.slice(7);
   const payload = verifyAccessToken(token);
   const user = await User.findById(payload.sub);
-  return user ? { user, method: "jwt" } : null;
+  return user ? { user, method: "jwt", apiKey: null } : null;
 }
 
 async function resolveUserByApiKey(req) {
@@ -30,7 +30,14 @@ async function resolveUserByApiKey(req) {
   }
   key.lastUsedAt = new Date();
   await key.save();
-  return { user, method: "api_key" };
+  return {
+    user,
+    method: "api_key",
+    apiKey: {
+      id: key._id,
+      keyPrefix: key.keyPrefix,
+    },
+  };
 }
 
 export async function requireAuth(req, res, next) {
@@ -41,6 +48,7 @@ export async function requireAuth(req, res, next) {
     }
     req.user = result.user;
     req.authMethod = result.method;
+    req.apiKey = result.apiKey;
     return next();
   } catch {
     return res.status(401).json({ message: "Invalid token" });
@@ -57,6 +65,7 @@ export async function requireUploadAuth(req, res, next) {
     }
     req.user = result.user;
     req.authMethod = result.method;
+    req.apiKey = result.apiKey;
     return next();
   } catch {
     return res.status(401).json({ message: "Invalid credentials" });

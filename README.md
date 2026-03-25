@@ -86,9 +86,9 @@ Copy-Item .\bin\up.exe "$HOME\AppData\Local\Microsoft\WindowsApps\up.exe"
 
 Auth for `up`:
 
-- `SSD_API_KEY` (recommended for script key, format `sk_...`)
+- `SSD_API_KEY` (recommended for script key, format `sk_...` or `uk_...`)
 - Fallback: `SSD_TOKEN`
-  - If value starts with `sk_`, `up` auto-sends `x-api-key`
+  - If value starts with `sk_` or `uk_`, `up` auto-sends `x-api-key`
   - Otherwise `up` sends `Authorization: Bearer ...`
 
 Shortest upload command (API key):
@@ -123,15 +123,15 @@ CLI output:
 If `up` reports missing credential:
 
 - Linux/macOS:
-  - `export SSD_API_KEY="sk_xxx"` (recommended)
+  - `export SSD_API_KEY="sk_xxx"` (recommended, also supports `uk_xxx`)
   - or `export SSD_TOKEN="your_jwt_token"`
 - Windows PowerShell:
-  - `$env:SSD_API_KEY="sk_xxx"` (recommended)
+  - `$env:SSD_API_KEY="sk_xxx"` (recommended, also supports `uk_xxx`)
   - or `$env:SSD_TOKEN="your_jwt_token"`
 
 If `up` reports `status 401` or `status 403`:
 
-- If using API key (`sk_...`): key is invalid/revoked or lacks permission.
+- If using API key (`sk_...` or `uk_...`): key is invalid/revoked or lacks permission.
 - If using JWT: token is invalid/expired or lacks permission.
 - Set a new credential again using the commands above.
 

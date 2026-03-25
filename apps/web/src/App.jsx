@@ -233,6 +233,8 @@ function Dashboard({ auth }) {
   const [keys, setKeys] = useState([]);
   const [error, setError] = useState("");
   const [newKeyName, setNewKeyName] = useState("");
+  const [newKeyType, setNewKeyType] = useState("random");
+  const [newCustomKey, setNewCustomKey] = useState("");
   const [lastPlaintextKey, setLastPlaintextKey] = useState("");
   const [selectedFile, setSelectedFile] = useState(null);
   const [topupAmount, setTopupAmount] = useState(1000);
@@ -298,11 +300,17 @@ function Dashboard({ auth }) {
 
   async function createKey() {
     try {
+      const payload = { name: newKeyName, keyType: newKeyType };
+      if (newKeyType === "custom") {
+        payload.customKey = newCustomKey;
+      }
       const data = await authedFetch("/api/keys", {
         method: "POST",
-        body: JSON.stringify({ name: newKeyName }),
+        body: JSON.stringify(payload),
       });
       setNewKeyName("");
+      setNewCustomKey("");
+      setNewKeyType("random");
       setLastPlaintextKey(data.plaintextKey);
       await loadData();
     } catch (err) {
@@ -487,7 +495,13 @@ function Dashboard({ auth }) {
           {files.map((file) => (
             <div key={file.id} className="flex items-center gap-3 rounded-lg border p-3">
               <div className="flex-1 text-sm">
-                {file.originalName} ({formatBytes(file.sizeBytes)}) - Charged: {file.costCharged}
+                <div>
+                  {file.originalName} ({formatBytes(file.sizeBytes)}) - Charged: {file.costCharged}
+                </div>
+                <div className="text-xs text-muted-foreground">
+                  via {file.authMethod === "api_key" ? file.apiKeyPrefix || "api key" : "jwt"} - IP:{" "}
+                  {file.clientIp || "-"}
+                </div>
               </div>
               <Button size="sm" variant="secondary" onClick={() => downloadFile(file.id)}>
                 Download
@@ -510,6 +524,25 @@ function Dashboard({ auth }) {
             value={newKeyName}
             onChange={(e) => setNewKeyName(e.target.value)}
           />
+          <div className="space-y-2">
+            <Label htmlFor="new-key-type">Token type</Label>
+            <select
+              id="new-key-type"
+              className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+              value={newKeyType}
+              onChange={(e) => setNewKeyType(e.target.value)}
+            >
+              <option value="random">Random secure (sk_...)</option>
+              <option value="custom">Custom memorable (uk_...)</option>
+            </select>
+          </div>
+          {newKeyType === "custom" && (
+            <Input
+              placeholder="Custom key suffix (ex: deploy_bot)"
+              value={newCustomKey}
+              onChange={(e) => setNewCustomKey(e.target.value)}
+            />
+          )}
           <Button onClick={createKey}>Create key</Button>
           {lastPlaintextKey && (
             <Alert>
@@ -520,7 +553,8 @@ function Dashboard({ auth }) {
           {keys.map((key) => (
             <div key={key.id} className="flex items-center gap-3 rounded-lg border p-3">
               <div className="flex-1 text-sm">
-                {key.name} - {key.keyPrefix}... {key.revokedAt ? "(revoked)" : ""}
+                {key.name} [{key.keyType === "custom" ? "custom" : "random"}] - {key.keyPrefix}...{" "}
+                {key.revokedAt ? "(revoked)" : ""}
               </div>
               {!key.revokedAt && (
                 <Button size="sm" variant="outline" onClick={() => revokeKey(key.id)}>

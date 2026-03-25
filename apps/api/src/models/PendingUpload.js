@@ -17,6 +17,11 @@ const pendingUploadSchema = new mongoose.Schema(
       default: "pending",
       index: true,
     },
+    authMethod: { type: String, enum: ["jwt", "api_key"], required: true },
+    apiKeyId: { type: mongoose.Schema.Types.ObjectId, ref: "ApiKey", default: null, index: true },
+    apiKeyPrefix: { type: String, default: null },
+    clientIp: { type: String, default: null },
+    userAgent: { type: String, default: null },
   },
   { timestamps: true }
 );

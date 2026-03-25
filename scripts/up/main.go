@@ -91,7 +91,7 @@ func main() {
 	uploadAuth, err := resolveUploadCredential()
 	if err != nil {
 		failf(
-			"No credential found. Set %s (recommended for sk_ API key) or %s.\n"+
+			"No credential found. Set %s (recommended for sk_/uk_ API key) or %s.\n"+
 				"\n"+
 				envSetupHint(authKindAPIKey, "sk_xxx"),
 			envAPIKey,
@@ -432,7 +432,7 @@ func resolveUploadCredential() (authCredential, error) {
 	if token == "" {
 		return authCredential{}, errors.New("missing credential env")
 	}
-	if strings.HasPrefix(token, "sk_") {
+	if strings.HasPrefix(token, "sk_") || strings.HasPrefix(token, "uk_") {
 		return authCredential{Kind: authKindAPIKey, Value: token, SourceEnv: envToken}, nil
 	}
 

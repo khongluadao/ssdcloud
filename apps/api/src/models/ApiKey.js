@@ -4,6 +4,7 @@ const apiKeySchema = new mongoose.Schema(
   {
     userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
     name: { type: String, required: true, trim: true },
+    keyType: { type: String, enum: ["random", "custom"], default: "random" },
     keyPrefix: { type: String, required: true },
     keyHash: { type: String, required: true, unique: true, index: true },
     lastUsedAt: { type: Date, default: null },

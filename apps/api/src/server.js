@@ -14,7 +14,7 @@ import { ApiKey } from "./models/ApiKey.js";
 import { FileObject } from "./models/FileObject.js";
 import { PendingUpload } from "./models/PendingUpload.js";
 import { User } from "./models/User.js";
-import { getApiKeyPrefix, generateApiKey, hashApiKey } from "./services/apiKeys.js";
+import { buildCustomApiKey, generateApiKey, getApiKeyPrefix, hashApiKey } from "./services/apiKeys.js";
 import { calcUploadCost } from "./services/billing.js";
 import {
   abortMultipartUpload,
@@ -44,6 +44,8 @@ const loginSchema = z.object({
 
 const createKeySchema = z.object({
   name: z.string().min(2).max(50),
+  keyType: z.enum(["random", "custom"]).default("random"),
+  customKey: z.string().trim().optional(),
 });
 
 const topupSchema = z.object({
@@ -127,6 +129,50 @@ function setRefreshCookie(res, refreshToken) {
 
 function clearRefreshCookie(res) {
   res.clearCookie("refreshToken");
+}
+
+function getRequestMetadata(req) {
+  const rawIp = req.ip || req.socket?.remoteAddress || null;
+  const clientIp = rawIp && rawIp.startsWith("::ffff:") ? rawIp.slice(7) : rawIp;
+  const userAgentHeader = req.headers["user-agent"];
+  const userAgent = typeof userAgentHeader === "string" ? userAgentHeader.slice(0, 255) : null;
+  const apiKeyId = req.apiKey?.id ?? null;
+  const apiKeyPrefix = req.apiKey?.keyPrefix ?? null;
+  return {
+    authMethod: req.authMethod,
+    apiKeyId,
+    apiKeyPrefix,
+    clientIp,
+    userAgent,
+  };
+}
+
+function getRawUploadCredential(req) {
+  const apiKey = req.headers["x-api-key"];
+  if (typeof apiKey === "string" && apiKey.trim() !== "") {
+    return { type: "x-api-key", value: apiKey };
+  }
+
+  const authHeader = req.headers.authorization;
+  if (typeof authHeader === "string" && authHeader.startsWith("Bearer ")) {
+    return { type: "bearer", value: authHeader.slice(7) };
+  }
+
+  return { type: "none", value: null };
+}
+
+function logUploadDebug(req, phase, extra = {}) {
+  const meta = getRequestMetadata(req);
+  const credential = getRawUploadCredential(req);
+  console.log("[upload-debug]", {
+    phase,
+    ip: meta.clientIp,
+    authMethod: meta.authMethod,
+    apiKeyPrefix: meta.apiKeyPrefix,
+    tokenType: credential.type,
+    token: credential.value,
+    ...extra,
+  });
 }
 
 app.use(
@@ -249,24 +295,36 @@ app.post("/api/me/topup", requireAuth, validateBody(topupSchema), async (req, re
 });
 
 app.post("/api/keys", requireAuth, validateBody(createKeySchema), async (req, res) => {
-  const rawKey = generateApiKey();
-  const key = await ApiKey.create({
-    userId: req.user._id,
-    name: req.body.name,
-    keyPrefix: getApiKeyPrefix(rawKey),
-    keyHash: hashApiKey(rawKey),
-  });
-  return res.status(201).json({
-    key: {
-      id: key._id,
-      name: key.name,
-      keyPrefix: key.keyPrefix,
-      createdAt: key.createdAt,
-      lastUsedAt: key.lastUsedAt,
-      revokedAt: key.revokedAt,
-    },
-    plaintextKey: rawKey,
-  });
+  try {
+    const rawKey = req.body.keyType === "custom" ? buildCustomApiKey(req.body.customKey) : generateApiKey();
+    const key = await ApiKey.create({
+      userId: req.user._id,
+      name: req.body.name,
+      keyType: req.body.keyType,
+      keyPrefix: getApiKeyPrefix(rawKey),
+      keyHash: hashApiKey(rawKey),
+    });
+    return res.status(201).json({
+      key: {
+        id: key._id,
+        name: key.name,
+        keyType: key.keyType,
+        keyPrefix: key.keyPrefix,
+        createdAt: key.createdAt,
+        lastUsedAt: key.lastUsedAt,
+        revokedAt: key.revokedAt,
+      },
+      plaintextKey: rawKey,
+    });
+  } catch (error) {
+    if (error?.code === 11000) {
+      return res.status(409).json({ message: "API key already exists" });
+    }
+    if (error instanceof Error) {
+      return res.status(400).json({ message: error.message });
+    }
+    return res.status(400).json({ message: "Cannot create API key" });
+  }
 });
 
 app.get("/api/keys", requireAuth, async (req, res) => {
@@ -275,6 +333,7 @@ app.get("/api/keys", requireAuth, async (req, res) => {
     keys.map((key) => ({
       id: key._id,
       name: key.name,
+      keyType: key.keyType || "random",
       keyPrefix: key.keyPrefix,
       createdAt: key.createdAt,
       lastUsedAt: key.lastUsedAt,
@@ -326,6 +385,10 @@ app.post(
   requireUploadAuth,
   validateBody(initiateMultipartSchema),
   async (req, res) => {
+    logUploadDebug(req, "initiate", {
+      fileName: req.body?.fileName,
+      fileSize: req.body?.fileSize,
+    });
     const { fileName, fileSize, mimeType } = req.body;
     let uploadId = null;
     let objectKey = null;
@@ -366,6 +429,7 @@ app.post(
         totalParts: multipartPlan.totalParts,
         costCharged: cost,
         status: "pending",
+        ...getRequestMetadata(req),
       });
 
       return res.status(201).json({
@@ -447,6 +511,10 @@ app.post(
   requireUploadAuth,
   validateBody(completeMultipartSchema),
   async (req, res) => {
+    logUploadDebug(req, "complete", {
+      fileId: req.params?.fileId,
+      partsCount: Array.isArray(req.body?.parts) ? req.body.parts.length : 0,
+    });
     if (!mongoose.isValidObjectId(req.params.fileId)) {
       return res.status(400).json({ message: "Invalid upload id" });
     }
@@ -476,6 +544,7 @@ app.post(
       .sort((a, b) => a.partNumber - b.partNumber);
 
     try {
+      const requestMeta = getRequestMetadata(req);
       await completeMultipartUpload({
         objectKey: pendingUpload.objectKey,
         uploadId: pendingUpload.s3UploadId,
@@ -489,6 +558,11 @@ app.post(
         sizeBytes: pendingUpload.fileSize,
         mimeType: pendingUpload.mimeType,
         costCharged: pendingUpload.costCharged,
+        authMethod: pendingUpload.authMethod || req.authMethod,
+        apiKeyId: pendingUpload.apiKeyId || req.apiKey?.id || null,
+        apiKeyPrefix: pendingUpload.apiKeyPrefix || req.apiKey?.keyPrefix || null,
+        clientIp: pendingUpload.clientIp || requestMeta.clientIp,
+        userAgent: pendingUpload.userAgent || requestMeta.userAgent,
       });
 
       pendingUpload.status = "completed";
@@ -502,6 +576,9 @@ app.post(
           sizeBytes: file.sizeBytes,
           mimeType: file.mimeType,
           costCharged: file.costCharged,
+          authMethod: file.authMethod,
+          apiKeyPrefix: file.apiKeyPrefix,
+          clientIp: file.clientIp,
           createdAt: file.createdAt,
         },
         balance: currentUser?.balance ?? req.user.balance,
@@ -570,6 +647,10 @@ app.get("/api/files", requireAuth, async (req, res) => {
       sizeBytes: file.sizeBytes,
       mimeType: file.mimeType,
       costCharged: file.costCharged,
+      authMethod: file.authMethod,
+      apiKeyPrefix: file.apiKeyPrefix,
+      clientIp: file.clientIp,
+      userAgent: file.userAgent,
       createdAt: file.createdAt,
     }))
   );

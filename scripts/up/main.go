@@ -10,13 +10,16 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
 
 const (
-	defaultBaseURL = "https://ssdcloud.net"
+	defaultBaseURL = "https://api.ssdcloud.net"
 	userAgent      = "ssdcloud-up/1.0"
+	envToken       = "SSD_TOKEN"
+	envAPIKey      = "SSD_API_KEY"
 )
 
 type initiateUploadRequest struct {
@@ -56,15 +59,44 @@ type downloadResponse struct {
 	URL string `json:"url"`
 }
 
+type requestError struct {
+	StatusCode int
+	URL        string
+	Message    string
+}
+
+type authKind string
+
+const (
+	authKindBearer authKind = "bearer"
+	authKindAPIKey authKind = "api_key"
+)
+
+type authCredential struct {
+	Kind      authKind
+	Value     string
+	SourceEnv string
+}
+
+func (e *requestError) Error() string {
+	return fmt.Sprintf("status %d at %s: %s", e.StatusCode, e.URL, e.Message)
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		failf("Usage: up <file-path>")
 	}
 
 	filePath := os.Args[1]
-	token := strings.TrimSpace(os.Getenv("SSD_TOKEN"))
-	if token == "" {
-		failf("SSD_TOKEN is required (example: SSD_TOKEN=eyJ... up ./file.zip)")
+	uploadAuth, err := resolveUploadCredential()
+	if err != nil {
+		failf(
+			"No credential found. Set %s (recommended for sk_ API key) or %s.\n"+
+				"\n"+
+				envSetupHint(authKindAPIKey, "sk_xxx"),
+			envAPIKey,
+			envToken,
+		)
 	}
 
 	baseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("SSD_BASE_URL")), "/")
@@ -91,7 +123,7 @@ func main() {
 		client,
 		http.MethodPost,
 		baseURL+"/api/files/upload/initiate",
-		token,
+		uploadAuth,
 		initiateUploadRequest{
 			FileName: fileName,
 			FileSize: totalSize,
@@ -100,7 +132,7 @@ func main() {
 		&initResp,
 	)
 	if err != nil {
-		failf("Initiate upload failed: %v", err)
+		failUploadStep("Initiate upload failed", err, uploadAuth)
 	}
 
 	if initResp.Upload.ID == "" || initResp.Upload.PartSize <= 0 || initResp.Upload.TotalPart <= 0 {
@@ -123,12 +155,12 @@ func main() {
 			client,
 			http.MethodPost,
 			fmt.Sprintf("%s/api/files/upload/%s/presign", baseURL, initResp.Upload.ID),
-			token,
+			uploadAuth,
 			map[string][]int{"partNumbers": []int{partNumber}},
 			&presignResp,
 		)
 		if err != nil {
-			failf("Presign part %d failed: %v", partNumber, err)
+			failUploadStep(fmt.Sprintf("Presign part %d failed", partNumber), err, uploadAuth)
 		}
 
 		partURL := presignResp.URLs[fmt.Sprintf("%d", partNumber)]
@@ -166,15 +198,21 @@ func main() {
 		client,
 		http.MethodPost,
 		fmt.Sprintf("%s/api/files/upload/%s/complete", baseURL, initResp.Upload.ID),
-		token,
+		uploadAuth,
 		completeUploadRequest{Parts: parts},
 		&completeResp,
 	)
 	if err != nil {
-		failf("Complete upload failed: %v", err)
+		failUploadStep("Complete upload failed", err, uploadAuth)
 	}
 	if completeResp.File.ID == "" {
 		failf("Complete response missing file id")
+	}
+
+	if uploadAuth.Kind == authKindAPIKey {
+		fmt.Printf("File ID: %s\n", completeResp.File.ID)
+		fmt.Println("Upload completed. Download link requires JWT (Authorization).")
+		return
 	}
 
 	var dlResp downloadResponse
@@ -182,12 +220,12 @@ func main() {
 		client,
 		http.MethodGet,
 		fmt.Sprintf("%s/api/files/%s/download", baseURL, completeResp.File.ID),
-		token,
+		uploadAuth,
 		nil,
 		&dlResp,
 	)
 	if err != nil {
-		failf("Get file link failed: %v", err)
+		failUploadStep("Get file link failed", err, uploadAuth)
 	}
 	if dlResp.URL == "" {
 		failf("Download response missing URL")
@@ -196,7 +234,7 @@ func main() {
 	fmt.Printf("Link: %s\n", dlResp.URL)
 }
 
-func authedJSON(client *http.Client, method, url, token string, body any, out any) error {
+func authedJSON(client *http.Client, method, url string, auth authCredential, body any, out any) error {
 	var bodyReader io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -210,7 +248,7 @@ func authedJSON(client *http.Client, method, url, token string, body any, out an
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	applyAuth(req, auth)
 	req.Header.Set("User-Agent", userAgent)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -231,7 +269,11 @@ func authedJSON(client *http.Client, method, url, token string, body any, out an
 		if msg == "" {
 			msg = "empty error response"
 		}
-		return fmt.Errorf("status %d: %s", resp.StatusCode, msg)
+		return &requestError{
+			StatusCode: resp.StatusCode,
+			URL:        url,
+			Message:    msg,
+		}
 	}
 
 	if out == nil || len(payload) == 0 {
@@ -307,6 +349,102 @@ func minInt64(a, b int64) int64 {
 		return a
 	}
 	return b
+}
+
+func failUploadStep(prefix string, err error, auth authCredential) {
+	var reqErr *requestError
+	if errors.As(err, &reqErr) && (reqErr.StatusCode == http.StatusUnauthorized || reqErr.StatusCode == http.StatusForbidden) {
+		if auth.Kind == authKindAPIKey {
+			failf(
+				"%s: %v\n"+
+					"\n"+
+					"API key is invalid/revoked or does not have permission.\n"+
+					"Set API key again:\n"+
+					"\n"+
+					envSetupHint(authKindAPIKey, "sk_xxx"),
+				prefix,
+				err,
+			)
+		}
+		failf(
+			"%s: %v\n"+
+				"\n"+
+				"Token is invalid/expired or does not have permission.\n"+
+				"Set token again:\n"+
+				"\n"+
+				envSetupHint(authKindBearer, "new_jwt_token"),
+			prefix,
+			err,
+		)
+	}
+	failf("%s: %v", prefix, err)
+}
+
+func envSetupHint(kind authKind, tokenPlaceholder string) string {
+	execName := filepath.Base(os.Args[0])
+	if execName == "" || strings.EqualFold(execName, "main") {
+		execName = "up"
+	}
+	if runtime.GOOS == "windows" {
+		if !strings.HasSuffix(strings.ToLower(execName), ".exe") {
+			execName += ".exe"
+		}
+		if kind == authKindAPIKey {
+			return fmt.Sprintf(
+				"Windows PowerShell:\n  $env:%s=\"%s\"\n  %s .\\file.zip",
+				envAPIKey,
+				tokenPlaceholder,
+				execName,
+			)
+		}
+		return fmt.Sprintf(
+			"Windows PowerShell:\n  $env:%s=\"%s\"\n  %s .\\file.zip",
+			envToken,
+			tokenPlaceholder,
+			execName,
+		)
+	}
+
+	if kind == authKindAPIKey {
+		return fmt.Sprintf(
+			"Linux/macOS:\n  export %s=\"%s\"\n  %s ./file.zip",
+			envAPIKey,
+			tokenPlaceholder,
+			execName,
+		)
+	}
+
+	return fmt.Sprintf(
+		"Linux/macOS:\n  export %s=\"%s\"\n  %s ./file.zip",
+		envToken,
+		tokenPlaceholder,
+		execName,
+	)
+}
+
+func resolveUploadCredential() (authCredential, error) {
+	apiKey := strings.TrimSpace(os.Getenv(envAPIKey))
+	if apiKey != "" {
+		return authCredential{Kind: authKindAPIKey, Value: apiKey, SourceEnv: envAPIKey}, nil
+	}
+
+	token := strings.TrimSpace(os.Getenv(envToken))
+	if token == "" {
+		return authCredential{}, errors.New("missing credential env")
+	}
+	if strings.HasPrefix(token, "sk_") {
+		return authCredential{Kind: authKindAPIKey, Value: token, SourceEnv: envToken}, nil
+	}
+
+	return authCredential{Kind: authKindBearer, Value: token, SourceEnv: envToken}, nil
+}
+
+func applyAuth(req *http.Request, auth authCredential) {
+	if auth.Kind == authKindAPIKey {
+		req.Header.Set("x-api-key", auth.Value)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+auth.Value)
 }
 
 func failf(format string, args ...any) {

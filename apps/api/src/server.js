@@ -4,7 +4,6 @@ import cookieParser from "cookie-parser";
 import cors from "cors";
 import express from "express";
 import rateLimit from "express-rate-limit";
-import multer from "multer";
 import mongoose from "mongoose";
 import { z } from "zod";
 import { config } from "./config.js";
@@ -23,18 +22,14 @@ import {
   completeMultipartUpload,
   createMultipartUpload,
   deleteFromStorage,
+  ensureBucketCors,
   ensureBucketExists,
   getPresignedPartUrl,
   getSignedDownloadUrl,
-  uploadToStorage,
 } from "./services/storage.js";
 import { issueAccessToken, issueRefreshToken, sha256, verifyRefreshToken } from "./services/tokens.js";
 
 const app = express();
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: config.uploadMaxMb * 1024 * 1024 },
-});
 
 const registerSchema = z.object({
   email: z.email(),
@@ -99,7 +94,6 @@ const uploadLimiter = rateLimit({
 const S3_MIN_PART_SIZE_BYTES = 5 * 1024 * 1024;
 const S3_MAX_PARTS = 10_000;
 const S3_MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024 * 1024 * 1024;
-const MULTIPART_THRESHOLD_BYTES = 100 * 1024 * 1024;
 
 function buildMultipartPlan(fileSize) {
   if (fileSize > S3_MAX_FILE_SIZE_BYTES) {
@@ -313,7 +307,7 @@ app.post(
     const cost = calcUploadCost(fileSize);
     const currentBalance = req.user.balance;
     const balanceAfter = currentBalance - cost;
-    const deliveryMode = fileSize > MULTIPART_THRESHOLD_BYTES ? "multipart" : "simple";
+    const deliveryMode = "multipart";
 
     return res.json({
       cost,
@@ -560,62 +554,10 @@ app.post("/api/files/upload/:fileId/abort", requireUploadAuth, async (req, res) 
   });
 });
 
-app.post("/api/files/upload", uploadLimiter, requireUploadAuth, upload.single("file"), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ message: "File is required" });
-  }
-
-  const cost = calcUploadCost(req.file.size);
-  const objectKey = buildObjectKey(req.user._id.toString(), req.file.originalname);
-
-  const deductedUser = await User.findOneAndUpdate(
-    {
-      _id: req.user._id,
-      balance: { $gte: cost },
-    },
-    { $inc: { balance: -cost } },
-    { new: true }
-  );
-
-  if (!deductedUser) {
-    return res.status(402).json({ message: "Insufficient balance" });
-  }
-
-  try {
-    await uploadToStorage({
-      objectKey,
-      buffer: req.file.buffer,
-      mimeType: req.file.mimetype || "application/octet-stream",
-    });
-
-    const file = await FileObject.create({
-      userId: req.user._id,
-      objectKey,
-      originalName: req.file.originalname,
-      sizeBytes: req.file.size,
-      mimeType: req.file.mimetype || "application/octet-stream",
-      costCharged: cost,
-    });
-
-    return res.status(201).json({
-      file: {
-        id: file._id,
-        originalName: file.originalName,
-        sizeBytes: file.sizeBytes,
-        mimeType: file.mimeType,
-        costCharged: file.costCharged,
-        createdAt: file.createdAt,
-      },
-      balance: deductedUser.balance,
-      authMethod: req.authMethod,
-    });
-  } catch (error) {
-    await User.updateOne({ _id: req.user._id }, { $inc: { balance: cost } });
-    return res.status(500).json({
-      message: "Upload failed and balance was rolled back",
-      error: error instanceof Error ? error.message : "unknown_error",
-    });
-  }
+app.post("/api/files/upload", uploadLimiter, requireUploadAuth, async (_req, res) => {
+  return res.status(410).json({
+    message: "Direct upload is disabled. Use presigned multipart endpoints.",
+  });
 });
 
 app.get("/api/files", requireAuth, async (req, res) => {
@@ -670,15 +612,13 @@ app.delete("/api/files/:id", requireAuth, async (req, res) => {
 });
 
 app.use((err, _req, res, _next) => {
-  if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
-    return res.status(413).json({ message: `Max file size is ${config.uploadMaxMb}MB` });
-  }
   return res.status(500).json({ message: "Internal server error" });
 });
 
 async function bootstrap() {
   await connectDatabase();
   await ensureBucketExists();
+  await ensureBucketCors();
   app.listen(config.port, () => {
     console.log(`API listening on http://localhost:${config.port}`);
   });

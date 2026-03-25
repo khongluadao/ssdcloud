@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, Navigate, Route, Routes, useNavigate } from "react-router-dom";
-import { apiFetch, getUploadQuote, multipartUpload, uploadFetch } from "./api";
+import { apiFetch, getUploadQuote, multipartUpload } from "./api";
 import { Alert, AlertDescription, AlertTitle } from "./components/ui/alert";
 import { Button } from "./components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./components/ui/card";
@@ -15,8 +15,6 @@ import {
 import { Input } from "./components/ui/input";
 import { Label } from "./components/ui/label";
 import { Progress } from "./components/ui/progress";
-
-const MULTIPART_THRESHOLD_BYTES = 100 * 1024 * 1024;
 
 function formatBytes(bytes) {
   if (!bytes || bytes < 0) return "0 B";
@@ -245,24 +243,51 @@ function Dashboard({ auth }) {
   const [quoteOpen, setQuoteOpen] = useState(false);
   const [quoteData, setQuoteData] = useState(null);
 
-  async function authedFetch(path, options = {}) {
-    return apiFetch(path, {
-      ...options,
-      headers: {
-        ...(options.headers || {}),
-        Authorization: `Bearer ${auth.token}`,
-      },
-    });
+  function currentAccessToken() {
+    return localStorage.getItem("accessToken") || auth.token;
+  }
+
+  async function authedFetch(path, options = {}, canRetry = true) {
+    try {
+      return await apiFetch(path, {
+        ...options,
+        headers: {
+          ...(options.headers || {}),
+          Authorization: `Bearer ${currentAccessToken()}`,
+        },
+      });
+    } catch (err) {
+      if (canRetry && err?.message === "Invalid token") {
+        await auth.refreshAccessToken();
+        return authedFetch(path, options, false);
+      }
+      throw err;
+    }
+  }
+
+  async function ensureAuthenticated() {
+    try {
+      await auth.fetchMe(currentAccessToken());
+    } catch (err) {
+      if (err?.message === "Invalid token") {
+        await auth.refreshAccessToken();
+        return;
+      }
+      throw err;
+    }
   }
 
   async function loadData() {
     try {
       setError("");
-      await auth.fetchMe(auth.token);
+      await ensureAuthenticated();
       const [fileData, keyData] = await Promise.all([authedFetch("/api/files"), authedFetch("/api/keys")]);
       setFiles(fileData);
       setKeys(keyData);
     } catch (err) {
+      if (err?.message === "Invalid refresh token" || err?.message === "Missing refresh token") {
+        auth.clearToken();
+      }
       setError(err.message);
     }
   }
@@ -311,9 +336,6 @@ function Dashboard({ auth }) {
 
   async function confirmUpload() {
     if (!selectedFile || !quoteData || isUploading) return;
-
-    const shouldUseMultipart =
-      quoteData.deliveryMode === "multipart" || selectedFile.size > MULTIPART_THRESHOLD_BYTES;
     const controller = new AbortController();
 
     try {
@@ -322,22 +344,15 @@ function Dashboard({ auth }) {
       setUploadController(controller);
       setUploadProgress(0);
 
-      if (shouldUseMultipart) {
-        await multipartUpload({
-          file: selectedFile,
-          token: auth.token,
-          signal: controller.signal,
-          onProgress: (uploaded, total) => {
-            const percent = Math.floor((uploaded / Math.max(total, 1)) * 100);
-            setUploadProgress(Math.min(100, percent));
-          },
-        });
-      } else {
-        const formData = new FormData();
-        formData.append("file", selectedFile);
-        await uploadFetch("/api/files/upload", { formData, token: auth.token });
-        setUploadProgress(100);
-      }
+      await multipartUpload({
+        file: selectedFile,
+        token: auth.token,
+        signal: controller.signal,
+        onProgress: (uploaded, total) => {
+          const percent = Math.floor((uploaded / Math.max(total, 1)) * 100);
+          setUploadProgress(Math.min(100, percent));
+        },
+      });
 
       setQuoteOpen(false);
       setQuoteData(null);
@@ -441,7 +456,7 @@ function Dashboard({ auth }) {
           {selectedFile && (
             <p className="text-sm text-muted-foreground">
               {selectedFile.name} ({formatBytes(selectedFile.size)}) - Mode:{" "}
-              {selectedFile.size > MULTIPART_THRESHOLD_BYTES ? "Multipart" : "Simple"}
+              Multipart
             </p>
           )}
           {isUploading && (
@@ -518,7 +533,11 @@ function Dashboard({ auth }) {
       </Card>
 
       <Dialog open={quoteOpen} onOpenChange={setQuoteOpen}>
-        <DialogContent>
+        <DialogContent
+          onInteractOutside={(event) => {
+            event.preventDefault();
+          }}
+        >
           <DialogHeader>
             <DialogTitle>Confirm upload cost</DialogTitle>
             <DialogDescription>

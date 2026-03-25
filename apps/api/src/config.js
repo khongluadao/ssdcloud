@@ -49,7 +49,7 @@ export const config = {
   jwtRefreshSecret: process.env.JWT_REFRESH_SECRET ?? "dev_refresh_secret",
   accessTokenTtl: process.env.ACCESS_TOKEN_TTL ?? "15m",
   refreshTokenTtl: process.env.REFRESH_TOKEN_TTL ?? "7d",
-  uploadPricePerMb: Number(process.env.UPLOAD_PRICE_PER_MB ?? 100),
+  uploadPricePerMb: Number(process.env.UPLOAD_PRICE_PER_MB ?? 0.5),
   uploadMaxMb: Number(process.env.UPLOAD_MAX_MB ?? 100),
   multipartPartSizeMb: Number(process.env.MULTIPART_PART_SIZE_MB ?? 100),
   s3Endpoint: process.env.S3_ENDPOINT,

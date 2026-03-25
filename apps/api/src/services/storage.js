@@ -6,6 +6,8 @@ import {
   GetObjectCommand,
   HeadBucketCommand,
   CreateBucketCommand,
+  PutBucketCorsCommand,
+  GetBucketCorsCommand,
   CreateMultipartUploadCommand,
   UploadPartCommand,
   CompleteMultipartUploadCommand,
@@ -45,6 +47,38 @@ export async function ensureBucketExists() {
   } catch {
     await client.send(new CreateBucketCommand({ Bucket: config.s3Bucket }));
   }
+}
+
+export async function ensureBucketCors() {
+  const corsRule = {
+    AllowedOrigins: [config.corsOrigin],
+    AllowedMethods: ["GET", "HEAD", "PUT", "POST", "DELETE"],
+    AllowedHeaders: ["*"],
+    ExposeHeaders: ["ETag"],
+    MaxAgeSeconds: 3600,
+  };
+
+  try {
+    const existing = await client.send(new GetBucketCorsCommand({ Bucket: config.s3Bucket }));
+    const rules = existing.CORSRules ?? [];
+    const alreadyConfigured = rules.some((rule) => {
+      const origins = rule.AllowedOrigins ?? [];
+      const methods = rule.AllowedMethods ?? [];
+      return origins.includes(config.corsOrigin) && methods.includes("PUT");
+    });
+    if (alreadyConfigured) {
+      return;
+    }
+  } catch {
+    // No existing CORS config; create one below.
+  }
+
+  await client.send(
+    new PutBucketCorsCommand({
+      Bucket: config.s3Bucket,
+      CORSConfiguration: { CORSRules: [corsRule] },
+    })
+  );
 }
 
 export async function deleteFromStorage(objectKey) {

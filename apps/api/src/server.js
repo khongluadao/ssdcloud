@@ -30,6 +30,7 @@ import {
 import { issueAccessToken, issueRefreshToken, sha256, verifyRefreshToken } from "./services/tokens.js";
 
 const app = express();
+app.set("trust proxy", config.trustProxy);
 
 const registerSchema = z.object({
   email: z.email(),

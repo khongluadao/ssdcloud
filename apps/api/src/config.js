@@ -24,6 +24,27 @@ function loadEnv() {
 
 loadEnv();
 
+function parseTrustProxy(value) {
+  if (value == null || value.trim() === "") {
+    return 0;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "true") {
+    return true;
+  }
+  if (normalized === "false") {
+    return false;
+  }
+
+  const parsed = Number(value);
+  if (Number.isInteger(parsed) && parsed >= 0) {
+    return parsed;
+  }
+
+  return value;
+}
+
 if (!process.env.S3_ENDPOINT) {
   throw new Error("S3_ENDPOINT is not set");
 }
@@ -52,6 +73,7 @@ export const config = {
   uploadPricePerMb: Number(process.env.UPLOAD_PRICE_PER_MB ?? 0.5),
   uploadMaxMb: Number(process.env.UPLOAD_MAX_MB ?? 100),
   multipartPartSizeMb: Number(process.env.MULTIPART_PART_SIZE_MB ?? 100),
+  trustProxy: parseTrustProxy(process.env.TRUST_PROXY),
   s3Endpoint: process.env.S3_ENDPOINT,
   s3Region: process.env.S3_REGION ?? "us-east-1",
   s3Bucket: process.env.S3_BUCKET ?? "ssdcloud-files",

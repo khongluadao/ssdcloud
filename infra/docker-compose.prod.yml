@@ -11,6 +11,8 @@ services:
     restart: unless-stopped
     env_file:
       - ../.env
+    environment:
+      TRUST_PROXY: "1"
     depends_on:
       - mongo
 

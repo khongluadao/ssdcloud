@@ -58,3 +58,33 @@ Or run smoke test script (automates initiate -> presign -> PUT part -> complete)
 ```bash
 node scripts/smoke-upload.mjs ./your-file.zip sk_xxx http://localhost:4000
 ```
+
+## Linux ELF uploader (`up`)
+
+Build binary ELF (from Windows, cross-compile for Linux):
+
+```powershell
+$env:GOOS="linux"; $env:GOARCH="amd64"; go build -ldflags="-s -w" -o bin/up ./scripts/up/main.go
+```
+
+Copy to Linux server and make it executable:
+
+```bash
+chmod +x ./up
+sudo mv ./up /usr/local/bin/up
+```
+
+Shortest upload command (set token by command):
+
+```bash
+SSD_TOKEN="your_jwt_token" up ./your-file.zip
+```
+
+Optional env:
+
+- `SSD_BASE_URL` (default: `https://ssdcloud.net`)
+
+CLI output:
+
+- Real-time upload percent (`Upload: xx.xx%`)
+- File link after success (`Link: https://...`)

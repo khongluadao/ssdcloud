@@ -1,0 +1,16 @@
+services:
+  mongo:
+    image: mongo:7.0
+    container_name: mongo-tx
+    restart: unless-stopped
+    ports:
+      - "27019:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: mon
+      MONGO_INITDB_ROOT_PASSWORD: Son1234
+      MONGO_RS_HOST: 127.0.0.1:27019
+    volumes:
+      - ./mongo-entrypoint.sh:/mongo-entrypoint.sh:ro
+      - ./mongo-keyfile:/etc/mongo-keyfile:ro
+      - ./mongo_data:/data/db
+    entrypoint: ["/bin/bash", "/mongo-entrypoint.sh"]

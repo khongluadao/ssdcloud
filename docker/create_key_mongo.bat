@@ -1,0 +1,1 @@
+[guid]::NewGuid().ToString() + [guid]::NewGuid().ToString() + [guid]::NewGuid().ToString() | Out-File -Encoding ascii mongo-keyfile

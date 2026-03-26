@@ -228,3 +228,30 @@ export async function multipartUpload({
     throw error;
   }
 }
+
+export async function upsertFileShare({ fileId, ttlSeconds, downloadCostToken, isActive, token }) {
+  return apiFetch(`/api/files/${fileId}/share`, {
+    method: "POST",
+    body: JSON.stringify({ ttlSeconds, downloadCostToken, isActive }),
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+}
+
+export async function getShareInfo(slug) {
+  return apiFetch(`/api/share/${slug}`);
+}
+
+export async function unlockShareDownload({ slug, token }) {
+  return apiFetch(`/api/share/${slug}/unlock`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+}
+
+export async function getShareDownloadUrl(slug) {
+  return apiFetch(`/api/share/${slug}/download`);
+}

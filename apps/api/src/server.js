@@ -11,11 +11,14 @@ import { connectDatabase } from "./db.js";
 import { requireAuth, requireUploadAuth } from "./middleware/auth.js";
 import { validateBody } from "./middleware/validate.js";
 import { ApiKey } from "./models/ApiKey.js";
+import { DownloadUnlock } from "./models/DownloadUnlock.js";
 import { FileObject } from "./models/FileObject.js";
 import { PendingUpload } from "./models/PendingUpload.js";
+import { ShareLink } from "./models/ShareLink.js";
 import { User } from "./models/User.js";
 import { buildCustomApiKey, generateApiKey, getApiKeyPrefix, hashApiKey } from "./services/apiKeys.js";
 import { calcUploadCost } from "./services/billing.js";
+import { clampShareTtlSeconds, computeSignedDownloadTtlSeconds, isShareExpired } from "./services/shareLinks.js";
 import {
   abortMultipartUpload,
   buildObjectKey,
@@ -80,6 +83,12 @@ const completeMultipartSchema = z.object({
     .max(10_000),
 });
 
+const updateShareSchema = z.object({
+  ttlSeconds: z.number().int().positive().optional(),
+  downloadCostToken: z.number().int().min(0).default(0),
+  isActive: z.boolean().optional(),
+});
+
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 30,
@@ -131,9 +140,13 @@ function clearRefreshCookie(res) {
   res.clearCookie("refreshToken");
 }
 
-function getRequestMetadata(req) {
+function getClientIp(req) {
   const rawIp = req.ip || req.socket?.remoteAddress || null;
-  const clientIp = rawIp && rawIp.startsWith("::ffff:") ? rawIp.slice(7) : rawIp;
+  return rawIp && rawIp.startsWith("::ffff:") ? rawIp.slice(7) : rawIp;
+}
+
+function getRequestMetadata(req) {
+  const clientIp = getClientIp(req);
   const userAgentHeader = req.headers["user-agent"];
   const userAgent = typeof userAgentHeader === "string" ? userAgentHeader.slice(0, 255) : null;
   const apiKeyId = req.apiKey?.id ?? null;
@@ -173,6 +186,35 @@ function logUploadDebug(req, phase, extra = {}) {
     token: credential.value,
     ...extra,
   });
+}
+
+function buildShareUrl(req, slug) {
+  const forwardedProto = typeof req.headers["x-forwarded-proto"] === "string" ? req.headers["x-forwarded-proto"] : "";
+  const proto = (forwardedProto.split(",")[0] || req.protocol || "http").trim();
+  const host = req.get("host");
+  if (!host) {
+    return `/share/${slug}`;
+  }
+  return `${proto}://${host}/share/${slug}`;
+}
+
+function createShareSlug() {
+  return crypto.randomBytes(9).toString("base64url");
+}
+
+function toShareSummary(req, share) {
+  const expiresAt = share.expiresAt ? new Date(share.expiresAt) : null;
+  const isExpired = isShareExpired(expiresAt);
+  return {
+    id: share._id,
+    slug: share.slug,
+    shareUrl: buildShareUrl(req, share.slug),
+    isActive: share.isActive,
+    downloadCostToken: share.downloadCostToken,
+    expiresAt,
+    isExpired,
+    whitelistCount: Array.isArray(share.whitelistIps) ? share.whitelistIps.length : 0,
+  };
 }
 
 app.use(
@@ -350,6 +392,198 @@ app.delete("/api/keys/:id", requireAuth, async (req, res) => {
   key.revokedAt = new Date();
   await key.save();
   return res.json({ message: "Key revoked" });
+});
+
+app.post("/api/files/:id/share", requireAuth, validateBody(updateShareSchema), async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) {
+    return res.status(400).json({ message: "Invalid file id" });
+  }
+
+  const file = await FileObject.findOne({ _id: req.params.id, userId: req.user._id }).select("_id userId");
+  if (!file) {
+    return res.status(404).json({ message: "File not found" });
+  }
+
+  const ttlSeconds = clampShareTtlSeconds(req.body.ttlSeconds, config);
+  const expiresAt = new Date(Date.now() + ttlSeconds * 1000);
+  const downloadCostToken = req.body.downloadCostToken;
+
+  let share = await ShareLink.findOne({ fileId: file._id });
+  if (!share) {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        share = await ShareLink.create({
+          fileId: file._id,
+          ownerUserId: req.user._id,
+          slug: createShareSlug(),
+          downloadCostToken,
+          expiresAt,
+          isActive: req.body.isActive ?? true,
+        });
+        break;
+      } catch (error) {
+        if (error?.code !== 11000) {
+          throw error;
+        }
+      }
+    }
+    if (!share) {
+      return res.status(500).json({ message: "Cannot create share link" });
+    }
+  } else {
+    share.downloadCostToken = downloadCostToken;
+    share.expiresAt = expiresAt;
+    if (typeof req.body.isActive === "boolean") {
+      share.isActive = req.body.isActive;
+    }
+    await share.save();
+  }
+
+  return res.json({
+    share: toShareSummary(req, share),
+  });
+});
+
+app.get("/api/share/:slug", async (req, res) => {
+  const share = await ShareLink.findOne({ slug: req.params.slug }).populate("fileId");
+  if (!share || !share.fileId) {
+    return res.status(404).json({ message: "Share link not found" });
+  }
+
+  const requesterIp = getClientIp(req);
+  const whitelisted = Boolean(requesterIp && share.whitelistIps.some((entry) => entry.ip === requesterIp));
+  return res.json({
+    share: {
+      ...toShareSummary(req, share),
+      requesterIp,
+      whitelisted,
+    },
+    file: {
+      id: share.fileId._id,
+      ownerUserId: share.fileId.userId,
+      originalName: share.fileId.originalName,
+      sizeBytes: share.fileId.sizeBytes,
+      mimeType: share.fileId.mimeType,
+      createdAt: share.fileId.createdAt,
+    },
+  });
+});
+
+app.post("/api/share/:slug/unlock", requireAuth, async (req, res) => {
+  const share = await ShareLink.findOne({ slug: req.params.slug }).populate("fileId");
+  if (!share || !share.fileId) {
+    return res.status(404).json({ message: "Share link not found" });
+  }
+  if (!share.isActive) {
+    return res.status(403).json({ message: "Share link is disabled" });
+  }
+  if (isShareExpired(share.expiresAt)) {
+    return res.status(410).json({ message: "Share link expired" });
+  }
+
+  const requesterIp = getClientIp(req);
+  if (!requesterIp) {
+    return res.status(400).json({ message: "Cannot resolve requester IP" });
+  }
+
+  const existing = share.whitelistIps.find((entry) => entry.ip === requesterIp);
+  if (existing) {
+    existing.lastUsedAt = new Date();
+    await share.save();
+
+    await DownloadUnlock.create({
+      shareLinkId: share._id,
+      fileId: share.fileId._id,
+      ownerUserId: share.ownerUserId,
+      payerUserId: req.user._id,
+      clientIp: requesterIp,
+      chargedAmount: 0,
+      status: "already_whitelisted",
+    });
+    return res.json({
+      message: "IP is already unlocked",
+      ip: requesterIp,
+      chargedAmount: 0,
+      whitelisted: true,
+    });
+  }
+
+  const cost = Number(share.downloadCostToken || 0);
+  let payer = req.user;
+  if (cost > 0) {
+    payer = await User.findOneAndUpdate(
+      {
+        _id: req.user._id,
+        balance: { $gte: cost },
+      },
+      { $inc: { balance: -cost } },
+      { new: true }
+    );
+    if (!payer) {
+      return res.status(402).json({ message: "Insufficient balance to unlock download" });
+    }
+  }
+
+  share.whitelistIps.push({
+    ip: requesterIp,
+    unlockedByUserId: req.user._id,
+    unlockedAt: new Date(),
+    lastUsedAt: new Date(),
+  });
+  await share.save();
+
+  await DownloadUnlock.create({
+    shareLinkId: share._id,
+    fileId: share.fileId._id,
+    ownerUserId: share.ownerUserId,
+    payerUserId: req.user._id,
+    clientIp: requesterIp,
+    chargedAmount: cost,
+    status: "charged",
+  });
+
+  return res.json({
+    message: "IP unlocked for this file",
+    ip: requesterIp,
+    chargedAmount: cost,
+    balance: payer.balance,
+    whitelisted: true,
+  });
+});
+
+app.get("/api/share/:slug/download", async (req, res) => {
+  const share = await ShareLink.findOne({ slug: req.params.slug }).populate("fileId");
+  if (!share || !share.fileId) {
+    return res.status(404).json({ message: "Share link not found" });
+  }
+  if (!share.isActive) {
+    return res.status(403).json({ message: "Share link is disabled" });
+  }
+  if (isShareExpired(share.expiresAt)) {
+    return res.status(410).json({ message: "Share link expired" });
+  }
+
+  const requesterIp = getClientIp(req);
+  if (!requesterIp) {
+    return res.status(400).json({ message: "Cannot resolve requester IP" });
+  }
+  const whitelistEntry = share.whitelistIps.find((entry) => entry.ip === requesterIp);
+  if (!whitelistEntry) {
+    return res.status(403).json({ message: "IP is not unlocked for this file" });
+  }
+
+  whitelistEntry.lastUsedAt = new Date();
+  await share.save();
+
+  const signedTtlSeconds = computeSignedDownloadTtlSeconds(
+    share.expiresAt,
+    config.downloadLinkMaxTtlSeconds
+  );
+  const url = await getSignedDownloadUrl(share.fileId.objectKey, signedTtlSeconds);
+  return res.json({
+    url,
+    expiresInSeconds: signedTtlSeconds,
+  });
 });
 
 app.post(
@@ -640,8 +874,15 @@ app.post("/api/files/upload", uploadLimiter, requireUploadAuth, async (_req, res
 
 app.get("/api/files", requireAuth, async (req, res) => {
   const files = await FileObject.find({ userId: req.user._id }).sort({ createdAt: -1 });
+  const fileIds = files.map((file) => file._id);
+  const shareLinks = fileIds.length
+    ? await ShareLink.find({ ownerUserId: req.user._id, fileId: { $in: fileIds } })
+    : [];
+  const shareByFileId = new Map(shareLinks.map((share) => [String(share.fileId), share]));
+
   return res.json(
     files.map((file) => ({
+      share: shareByFileId.get(String(file._id)) ? toShareSummary(req, shareByFileId.get(String(file._id))) : null,
       id: file._id,
       originalName: file.originalName,
       sizeBytes: file.sizeBytes,

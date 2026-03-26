@@ -1,6 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link, Navigate, Route, Routes, useNavigate } from "react-router-dom";
-import { apiFetch, getUploadQuote, multipartUpload } from "./api";
+import { Link, Navigate, Route, Routes, useNavigate, useParams } from "react-router-dom";
+import {
+  apiFetch,
+  getShareDownloadUrl,
+  getShareInfo,
+  getUploadQuote,
+  multipartUpload,
+  unlockShareDownload,
+  upsertFileShare,
+} from "./api";
 import { Alert, AlertDescription, AlertTitle } from "./components/ui/alert";
 import { Button } from "./components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./components/ui/card";
@@ -26,6 +34,13 @@ function formatBytes(bytes) {
     unitIndex += 1;
   }
   return `${size.toFixed(unitIndex === 0 ? 0 : 2)} ${units[unitIndex]}`;
+}
+
+function formatDateTime(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  return date.toLocaleString();
 }
 
 function useAuth() {
@@ -244,6 +259,8 @@ function Dashboard({ auth }) {
   const [uploadController, setUploadController] = useState(null);
   const [quoteOpen, setQuoteOpen] = useState(false);
   const [quoteData, setQuoteData] = useState(null);
+  const [shareDrafts, setShareDrafts] = useState({});
+  const [savingShareId, setSavingShareId] = useState("");
 
   function currentAccessToken() {
     return localStorage.getItem("accessToken") || auth.token;
@@ -286,6 +303,20 @@ function Dashboard({ auth }) {
       const [fileData, keyData] = await Promise.all([authedFetch("/api/files"), authedFetch("/api/keys")]);
       setFiles(fileData);
       setKeys(keyData);
+      setShareDrafts((prev) => {
+        const next = { ...prev };
+        for (const file of fileData) {
+          if (next[file.id]) continue;
+          next[file.id] = {
+            ttlHours: file.share?.expiresAt
+              ? Math.max(1, Math.round((new Date(file.share.expiresAt).getTime() - Date.now()) / (60 * 60 * 1000)))
+              : 6,
+            downloadCostToken: Number(file.share?.downloadCostToken ?? 0),
+            isActive: file.share?.isActive ?? true,
+          };
+        }
+        return next;
+      });
     } catch (err) {
       if (err?.message === "Invalid refresh token" || err?.message === "Missing refresh token") {
         auth.clearToken();
@@ -418,9 +449,89 @@ function Dashboard({ auth }) {
     }
   }
 
+  function getShareDraft(file) {
+    return (
+      shareDrafts[file.id] || {
+        ttlHours: 6,
+        downloadCostToken: Number(file.share?.downloadCostToken ?? 0),
+        isActive: file.share?.isActive ?? true,
+      }
+    );
+  }
+
+  function setShareDraftField(fileId, key, value) {
+    setShareDrafts((prev) => ({
+      ...prev,
+      [fileId]: {
+        ...(prev[fileId] || { ttlHours: 6, downloadCostToken: 0, isActive: true }),
+        [key]: value,
+      },
+    }));
+  }
+
+  async function saveShare(file) {
+    const draft = getShareDraft(file);
+    try {
+      setError("");
+      setSavingShareId(file.id);
+      const token = currentAccessToken();
+      await upsertFileShare({
+        fileId: file.id,
+        ttlSeconds: Number(draft.ttlHours) * 60 * 60,
+        downloadCostToken: Number(draft.downloadCostToken),
+        isActive: Boolean(draft.isActive),
+        token,
+      });
+      await loadData();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSavingShareId("");
+    }
+  }
+
+  async function copyShareLink(url) {
+    if (!url) return;
+    try {
+      await navigator.clipboard.writeText(url);
+    } catch {
+      // Ignore clipboard failures.
+    }
+  }
+
+  function jumpToSection(sectionId) {
+    const target = document.getElementById(sectionId);
+    if (target) {
+      target.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }
+
   return (
     <div className="mx-auto max-w-5xl space-y-4 p-6">
-      <Card>
+      <Card className="sticky top-2 z-10">
+        <CardContent className="flex flex-wrap items-center gap-2 p-3">
+          <Button size="sm" variant="secondary" asChild>
+            <Link to="/">Trang chu</Link>
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => jumpToSection("dashboard-overview")}>
+            Tong quan
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => jumpToSection("dashboard-upload")}>
+            Upload
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => jumpToSection("dashboard-files")}>
+            Files
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => jumpToSection("dashboard-keys")}>
+            API keys
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => jumpToSection("dashboard-topup")}>
+            Topup
+          </Button>
+        </CardContent>
+      </Card>
+
+      <Card id="dashboard-overview">
         <CardHeader className="flex-row items-center justify-between space-y-0">
           <div>
             <CardTitle>Dashboard</CardTitle>
@@ -432,7 +543,7 @@ function Dashboard({ auth }) {
         </CardHeader>
         <CardContent className="space-y-3">
           <p className="text-sm text-muted-foreground">Balance: {auth.user?.balance ?? 0}</p>
-          <div className="flex gap-3">
+          <div id="dashboard-topup" className="flex gap-3">
             <Input
               type="number"
               min={1}
@@ -450,7 +561,7 @@ function Dashboard({ auth }) {
         </CardContent>
       </Card>
 
-      <Card>
+      <Card id="dashboard-upload">
         <CardHeader>
           <CardTitle>Upload file</CardTitle>
           <CardDescription>Get server quote and confirm cost before upload starts.</CardDescription>
@@ -486,35 +597,95 @@ function Dashboard({ auth }) {
         </CardContent>
       </Card>
 
-      <Card>
+      <Card id="dashboard-files">
         <CardHeader>
           <CardTitle>Files</CardTitle>
         </CardHeader>
         <CardContent className="space-y-3">
           {files.length === 0 && <p className="text-sm text-muted-foreground">No files yet.</p>}
           {files.map((file) => (
-            <div key={file.id} className="flex items-center gap-3 rounded-lg border p-3">
-              <div className="flex-1 text-sm">
-                <div>
-                  {file.originalName} ({formatBytes(file.sizeBytes)}) - Charged: {file.costCharged}
+            <div key={file.id} className="space-y-3 rounded-lg border p-3">
+              <div className="flex items-center gap-3">
+                <div className="flex-1 text-sm">
+                  <div>
+                    {file.originalName} ({formatBytes(file.sizeBytes)}) - Charged: {file.costCharged}
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    via {file.authMethod === "api_key" ? file.apiKeyPrefix || "api key" : "jwt"} - IP:{" "}
+                    {file.clientIp || "-"}
+                  </div>
                 </div>
-                <div className="text-xs text-muted-foreground">
-                  via {file.authMethod === "api_key" ? file.apiKeyPrefix || "api key" : "jwt"} - IP:{" "}
-                  {file.clientIp || "-"}
+                <Button size="sm" variant="secondary" onClick={() => downloadFile(file.id)}>
+                  Download
+                </Button>
+                <Button size="sm" variant="outline" onClick={() => deleteFile(file.id)}>
+                  Delete
+                </Button>
+              </div>
+
+              <div className="grid gap-2 text-sm md:grid-cols-4">
+                <div className="space-y-1">
+                  <Label htmlFor={`ttl-${file.id}`}>Expiry (hours)</Label>
+                  <Input
+                    id={`ttl-${file.id}`}
+                    type="number"
+                    min={1}
+                    value={getShareDraft(file).ttlHours}
+                    onChange={(e) => setShareDraftField(file.id, "ttlHours", e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor={`cost-${file.id}`}>Unlock cost</Label>
+                  <Input
+                    id={`cost-${file.id}`}
+                    type="number"
+                    min={0}
+                    value={getShareDraft(file).downloadCostToken}
+                    onChange={(e) => setShareDraftField(file.id, "downloadCostToken", e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor={`active-${file.id}`}>Status</Label>
+                  <select
+                    id={`active-${file.id}`}
+                    className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                    value={getShareDraft(file).isActive ? "active" : "disabled"}
+                    onChange={(e) => setShareDraftField(file.id, "isActive", e.target.value === "active")}
+                  >
+                    <option value="active">Active</option>
+                    <option value="disabled">Disabled</option>
+                  </select>
+                </div>
+                <div className="flex items-end">
+                  <Button onClick={() => saveShare(file)} disabled={savingShareId === file.id}>
+                    {savingShareId === file.id ? "Saving..." : "Save share link"}
+                  </Button>
                 </div>
               </div>
-              <Button size="sm" variant="secondary" onClick={() => downloadFile(file.id)}>
-                Download
-              </Button>
-              <Button size="sm" variant="outline" onClick={() => deleteFile(file.id)}>
-                Delete
-              </Button>
+
+              {file.share && (
+                <div className="rounded-md border p-2 text-xs text-muted-foreground">
+                  <div>Share: {file.share.shareUrl}</div>
+                  <div>
+                    Expires: {formatDateTime(file.share.expiresAt)} ({file.share.isExpired ? "expired" : "active"})
+                  </div>
+                  <div>Whitelisted IPs: {file.share.whitelistCount}</div>
+                  <div className="mt-2 flex gap-2">
+                    <Button size="sm" variant="secondary" onClick={() => copyShareLink(file.share.shareUrl)}>
+                      Copy link
+                    </Button>
+                    <Button size="sm" variant="outline" asChild>
+                      <Link to={`/share/${file.share.slug}`}>Open share page</Link>
+                    </Button>
+                  </div>
+                </div>
+              )}
             </div>
           ))}
         </CardContent>
       </Card>
 
-      <Card>
+      <Card id="dashboard-keys">
         <CardHeader>
           <CardTitle>API keys</CardTitle>
         </CardHeader>
@@ -618,6 +789,148 @@ function Dashboard({ auth }) {
   );
 }
 
+function SharePage({ auth }) {
+  const { slug } = useParams();
+  const navigate = useNavigate();
+  const [data, setData] = useState(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [isUnlocking, setIsUnlocking] = useState(false);
+  const [isLoadingUrl, setIsLoadingUrl] = useState(false);
+
+  async function loadShare() {
+    if (!slug) return;
+    try {
+      setError("");
+      setLoading(true);
+      const next = await getShareInfo(slug);
+      setData(next);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    loadShare();
+  }, [slug]);
+
+  async function unlock() {
+    if (!auth.token) {
+      navigate("/login");
+      return;
+    }
+    try {
+      setError("");
+      setIsUnlocking(true);
+      await unlockShareDownload({ slug, token: auth.token });
+      await auth.fetchMe(auth.token);
+      await loadShare();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setIsUnlocking(false);
+    }
+  }
+
+  async function downloadNow() {
+    try {
+      setError("");
+      setIsLoadingUrl(true);
+      const result = await getShareDownloadUrl(slug);
+      window.open(result.url, "_blank");
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setIsLoadingUrl(false);
+    }
+  }
+
+  function jumpToShareSection(sectionId) {
+    const target = document.getElementById(sectionId);
+    if (target) {
+      target.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }
+
+  if (loading) {
+    return <div className="mx-auto max-w-2xl p-6 text-sm text-muted-foreground">Loading share link...</div>;
+  }
+
+  if (!data) {
+    return <div className="mx-auto max-w-2xl p-6 text-sm text-muted-foreground">Share link not found.</div>;
+  }
+
+  const share = data.share;
+  const file = data.file;
+  const canDownload = Boolean(share?.whitelisted && !share?.isExpired && share?.isActive);
+
+  return (
+    <div className="mx-auto max-w-2xl p-6">
+      <Card className="sticky top-2 z-10 mb-4">
+        <CardContent className="flex flex-wrap items-center gap-2 p-3">
+          <Button size="sm" variant="secondary" asChild>
+            <Link to="/">Trang chu</Link>
+          </Button>
+          {auth.token ? (
+            <Button size="sm" variant="outline" asChild>
+              <Link to="/dashboard">Dashboard</Link>
+            </Button>
+          ) : (
+            <Button size="sm" variant="outline" asChild>
+              <Link to="/login">Dang nhap</Link>
+            </Button>
+          )}
+          <Button size="sm" variant="outline" onClick={() => jumpToShareSection("share-overview")}>
+            Tong quan
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => jumpToShareSection("share-actions")}>
+            Mo khoa
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => jumpToShareSection("share-status")}>
+            Trang thai
+          </Button>
+        </CardContent>
+      </Card>
+
+      <Card id="share-overview">
+        <CardHeader id="share-status">
+          <CardTitle>Shared file download</CardTitle>
+          <CardDescription>{file?.originalName || "-"}</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3 text-sm">
+          <p>Size: {formatBytes(file?.sizeBytes || 0)}</p>
+          <p>Cost to unlock: {share?.downloadCostToken ?? 0} token</p>
+          <p>Expires: {formatDateTime(share?.expiresAt)}</p>
+          <p>Your IP: {share?.requesterIp || "-"}</p>
+          <p>Whitelist status: {share?.whitelisted ? "Unlocked" : "Not unlocked"}</p>
+          {share?.whitelisted && <p className="text-muted-foreground">This IP is already unlocked for this file.</p>}
+          {error && (
+            <Alert variant="destructive">
+              <AlertTitle>Action failed</AlertTitle>
+              <AlertDescription>{error}</AlertDescription>
+            </Alert>
+          )}
+          <div id="share-actions" className="flex gap-3">
+            <Button onClick={unlock} disabled={isUnlocking || share?.whitelisted || share?.isExpired || !share?.isActive}>
+              {isUnlocking ? "Unlocking..." : "Unlock for this IP"}
+            </Button>
+            <Button variant="secondary" onClick={downloadNow} disabled={!canDownload || isLoadingUrl}>
+              {isLoadingUrl ? "Getting link..." : "Download"}
+            </Button>
+          </div>
+          {!auth.token && (
+            <p className="text-muted-foreground">
+              You need to login before unlocking download so token balance can be deducted.
+            </p>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
 function ProtectedRoute({ auth, children }) {
   if (!auth.isAuthenticated) {
     return <Navigate to="/login" replace />;
@@ -633,6 +946,7 @@ export default function App() {
       <Route path="/" element={<Landing />} />
       <Route path="/register" element={<Register auth={auth} />} />
       <Route path="/login" element={<Login auth={auth} />} />
+      <Route path="/share/:slug" element={<SharePage auth={auth} />} />
       <Route
         path="/dashboard"
         element={

@@ -6,3 +6,5 @@ dist
 coverage
 *.log
 uploads
+scripts/up/up.exe
+scripts/up/up
